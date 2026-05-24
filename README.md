@@ -155,7 +155,7 @@ For a production system at higher throughput, I would:
 - **PgBouncer pooling** is essential for Postgres connection limits, but introduces slight latency. Connection pooling could be optimized per request type (read-only vs. write).
 - **Zod validation** is comprehensive but adds some runtime overhead. For ultra-high throughput, consider JIT-compiled validation or schema compilation.
 
-### If You Had More Time
+### If I Had More Time
 
 1. **Implement Kafka-based inventory events** for downstream systems (analytics, replication, webhooks).
 2. **Add GraphQL API** alongside REST for more flexible client queries.
