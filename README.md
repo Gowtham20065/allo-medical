@@ -28,30 +28,49 @@ Pending reservations increase `reservedUnits`. Confirmed reservations decrease b
 
 ## Local Setup
 
-Create a hosted Postgres database in Supabase, Neon, Railway, or another provider and set:
+### Prerequisites
+
+- Node.js 18+ and npm
+- A hosted Postgres database (Supabase, Neon, Railway, or similar)
+
+### Step 1: Configure Environment Variables
+
+Create a local `.env` file by copying the template:
 
 ```bash
 cp .env.example .env
 ```
 
-Fill in:
+Then fill in the required variables:
 
 ```bash
-DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require"
+# Supabase pooled connection for app queries (uses PgBouncer for connection pooling).
+DATABASE_URL="postgresql://USER:PASSWORD@POOLER_HOST:6543/postgres?pgbouncer=true"
+
+# Supabase direct database connection for Prisma migrations (bypasses PgBouncer).
+DIRECT_URL="postgresql://USER:PASSWORD@DIRECT_HOST:5432/postgres"
+
+# How long reservations remain pending before expiring (in minutes).
 RESERVATION_TTL_MINUTES=10
-CRON_SECRET="change-me"
+
+# Secret for authorizing cron job requests from Vercel.
+CRON_SECRET="change-me-to-a-random-string"
 ```
 
-Install dependencies, migrate, seed, and run:
+**Important:** The `DATABASE_URL` uses a pooled connection (PgBouncer) for fast query execution, while `DIRECT_URL` is a direct connection required by Prisma for migrations.
+
+### Step 2: Install Dependencies and Setup Database
 
 ```bash
 npm install
-npm run prisma:migrate
-npm run prisma:seed
-npm run dev
+npm run prisma:migrate  # Run migrations to create tables
+npm run prisma:seed    # Populate sample products, warehouses, and stock levels
+npm run dev            # Start the development server
 ```
 
-Open `http://localhost:3000`.
+### Step 3: Access the App
+
+Open your browser and navigate to `http://localhost:3000`.
 
 ## API
 
@@ -95,25 +114,55 @@ Implementation details:
 
 The release endpoint is naturally safe for repeated calls because releasing an already released reservation returns the released state.
 
-## Expiry in Production
+## Expiry Mechanism
 
-This implementation uses lazy cleanup plus a cron-compatible endpoint.
+### How It Works
 
-Lazy cleanup runs before product reads and reservation mutations. That means expired holds are released as soon as normal traffic touches inventory.
+The reservation system uses a **lazy cleanup + scheduled cron** approach for expiring reservations:
 
-For production, configure Vercel Cron to call:
+1. **Lazy Cleanup**: When a user performs any action that reads inventory (e.g., viewing products), expired pending reservations are automatically released before the stock levels are computed. This ensures stale holds don't artificially reduce available inventory.
 
-```txt
-/api/cron/release-expired
+   ```typescript
+   // In product listing and reservation mutations:
+   await releaseExpiredReservations();  // Cleanup first, then proceed
+   ```
+
+2. **Scheduled Cron Job**: To ensure expired reservations are cleaned up even during low-traffic periods, a background cron job runs periodically to release all expired pending reservations.
+
+### Production Configuration
+
+For production deployment on Vercel, configure a cron schedule to call:
+
+```bash
+GET/POST /api/cron/release-expired?authorization=Bearer%20$CRON_SECRET
 ```
 
-Send:
-
-```txt
+**Headers:**
+```
 Authorization: Bearer $CRON_SECRET
 ```
 
-A one-minute cron cadence is enough for this demo. At larger scale, I would move this into a queue-backed worker that processes reservations by `expiresAt` and records metrics for late release lag.
+Recommended cadence: **1 minute** for this demo. The cron job:
+- Finds all pending reservations where `expiresAt <= NOW()`
+- Updates them to `released` state in a single transaction
+- Decrements `reservedUnits` accordingly
+- Returns the count of released reservations
+
+### Why This Design?
+
+- **Fault-tolerant**: Even if cron fails or is delayed, lazy cleanup ensures correctness during user actions
+- **Simple**: No external job queue or worker infrastructure needed for a demo
+- **Fast**: Most expiry cleanup happens naturally with user traffic
+- **Observable**: The cron endpoint provides visibility into cleanup operations
+
+### At Scale
+
+For a production system at higher throughput, I would:
+- Move cleanup to a **dedicated background worker** (e.g., AWS Lambda, Bull queue with Redis)
+- Process reservations **by batch** using the `expiresAt` index
+- Record **metrics**: cleanup latency, count of late releases, reprocessing attempts
+- Implement **prioritization**: process reservations closest to expiry first
+- Add **dead letter queue**: handle stuck reservations separately
 
 ## Deployment
 
@@ -130,9 +179,62 @@ npm run prisma:seed
 5. Deploy the app on Vercel.
 6. Add a Vercel Cron schedule for `/api/cron/release-expired`.
 
-## Trade-offs
+## Trade-offs & Future Improvements
 
-- The demo reserves one unit at a time from the UI, while the API supports larger quantities.
-- Idempotency records do not expire yet. In production I would add a retention policy or scheduled cleanup.
-- The stock counter is intentionally simple. For auditability at scale, I would add an append-only inventory ledger and derive counters from ledger snapshots.
-- The cron endpoint is enough for this exercise. A background worker would provide better observability and tighter release timing under low traffic.
+### Current Decisions
+
+1. **Single Unit Reservations in UI**
+   - The frontend only reserves one unit at a time, even though the API supports arbitrary quantities.
+   - **Trade-off**: Simpler UI/UX, but less flexible for wholesale or bulk purchase flows.
+   - **Future**: Would add quantity selection if supporting B2B or bulk orders.
+
+2. **Simple Stock Counter**
+   - Stock levels are stored as simple counters: `totalUnits` and `reservedUnits`.
+   - **Trade-off**: Fast queries and easy to reason about, but no audit trail of inventory changes.
+   - **Future**: Implement an **append-only inventory ledger** that records every stock movement (receive, reserve, confirm, release, adjustment). Derive current counters from ledger snapshots for auditability and debugging.
+
+3. **Eager Idempotency Records**
+   - Idempotency records are persisted indefinitely in the database.
+   - **Trade-off**: Simple implementation, but the table grows unbounded.
+   - **Future**: Add a **retention policy** (e.g., keep records for 24 hours) with automatic cleanup scheduled via cron.
+
+4. **Lazy Expiry Cleanup + Cron**
+   - Lazy cleanup on user traffic + periodic cron job instead of a dedicated worker.
+   - **Trade-off**: No external infrastructure, but cleanup timing depends on traffic patterns. Low-traffic periods may delay expiry by up to the cron interval.
+   - **Future**: Move to a **message queue-backed worker** (e.g., Redis with Bull, AWS SQS + Lambda) for:
+     - Guaranteed cleanup within seconds
+     - Better metrics and alerting
+     - Decoupling from request-response cycles
+
+5. **No Distributed Transaction Guarantees Beyond Postgres**
+   - If a reserve request succeeds but the response is lost, the client may retry and create a duplicate pending reservation.
+   - **Trade-off**: Mitigated by idempotency keys, but idempotency records themselves are not replicated across regions.
+   - **Future**: For multi-region deployment, use **Postgres logical replication** or an external idempotency service (e.g., Supabase with read replicas).
+
+6. **No Monitoring or Alerting**
+   - The system logs operations but has no real-time alerts for inventory anomalies or cron failures.
+   - **Future**: Add:
+     - Prometheus metrics (reservation count, expiry lag, cron execution time)
+     - Structured logging to a log aggregation service (e.g., Datadog, CloudWatch)
+     - Alerts for late cron runs or failed migrations
+
+7. **Authorization is Minimal**
+   - Cron jobs are authenticated only by a shared secret header.
+   - **Trade-off**: Simple, but not suitable for multi-tenant systems.
+   - **Future**: Implement proper RBAC with JWT tokens or OAuth for API endpoints if multi-user access is needed.
+
+### Architectural Considerations
+
+- **Serializable transactions** ensure correctness under high concurrency, but may cause transaction aborts under extreme contention. A future implementation could use optimistic locking (version numbers) for less strict isolation if throughput becomes a bottleneck.
+- **PgBouncer pooling** is essential for Postgres connection limits, but introduces slight latency. Connection pooling could be optimized per request type (read-only vs. write).
+- **Zod validation** is comprehensive but adds some runtime overhead. For ultra-high throughput, consider JIT-compiled validation or schema compilation.
+
+### If You Had More Time
+
+1. **Implement Kafka-based inventory events** for downstream systems (analytics, replication, webhooks).
+2. **Add GraphQL API** alongside REST for more flexible client queries.
+3. **Multi-region deployment** with active-active Postgres replicas and conflict resolution.
+4. **Real-time WebSocket updates** so clients see stock changes instantly.
+5. **Inventory forecast integration** to recommend hold durations and stock reorder points.
+6. **Admin dashboard** for monitoring reservations, stock levels, and cron health.
+7. **Load testing** to validate concurrent reserve limits and measure P99 latency.
