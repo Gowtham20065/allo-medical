@@ -9,23 +9,6 @@ Checkout-time inventory reservations for multi-warehouse retail. The app lets a 
 - Zod for request validation
 - Tailwind CSS for the UI
 
-## Data Model
-
-The core tables are:
-
-- `Product` and `Warehouse`
-- `StockLevel`, keyed by `(productId, warehouseId)`, with `totalUnits` and `reservedUnits`
-- `Reservation`, with `pending`, `confirmed`, and `released` states plus `expiresAt`
-- `IdempotencyRecord`, keyed by `(Idempotency-Key, method, path)`
-
-Available stock is always computed as:
-
-```txt
-availableUnits = totalUnits - reservedUnits
-```
-
-Pending reservations increase `reservedUnits`. Confirmed reservations decrease both `totalUnits` and `reservedUnits`. Released or expired reservations decrease `reservedUnits`.
-
 ## Local Setup
 
 ### Prerequisites
@@ -71,48 +54,6 @@ npm run dev            # Start the development server
 ### Step 3: Access the App
 
 Open your browser and navigate to `http://localhost:3000`.
-
-## API
-
-| Method | Path | Behavior |
-| --- | --- | --- |
-| `GET` | `/api/products` | Lists products and available stock per warehouse |
-| `GET` | `/api/warehouses` | Lists warehouses |
-| `POST` | `/api/reservations` | Reserves units, returns `409` when stock is unavailable |
-| `GET` | `/api/reservations/:id` | Fetches a reservation for the checkout page |
-| `POST` | `/api/reservations/:id/confirm` | Confirms the reservation, returns `410` when expired |
-| `POST` | `/api/reservations/:id/release` | Releases a pending reservation |
-| `GET` or `POST` | `/api/cron/release-expired` | Releases expired pending reservations |
-
-## Concurrency Guarantee
-
-The reserve endpoint does not read available stock in application code and then update later. It performs a single guarded Postgres update inside a serializable transaction:
-
-```sql
-UPDATE "StockLevel"
-SET "reservedUnits" = "reservedUnits" + $quantity
-WHERE "productId" = $productId
-  AND "warehouseId" = $warehouseId
-  AND "totalUnits" - "reservedUnits" >= $quantity
-```
-
-If two requests race for the last unit, Postgres serializes the row update. Exactly one update can affect one row. The loser affects zero rows and receives `409 Not enough stock available`.
-
-Confirmation and release also run in serializable transactions. Confirming a pending reservation decrements both `totalUnits` and `reservedUnits`; releasing decrements only `reservedUnits`.
-
-## Idempotency
-
-`POST /api/reservations` and `POST /api/reservations/:id/confirm` support an `Idempotency-Key` header.
-
-Implementation details:
-
-- The server hashes the request body and stores the original status code and JSON response.
-- The unique key is `(key, method, path)`.
-- A Postgres advisory transaction lock serializes concurrent retries using the same key.
-- Reusing the same key with a different request body returns `409`.
-- Reusing the same key with the same request returns the original response without applying the side effect again.
-
-The release endpoint is naturally safe for repeated calls because releasing an already released reservation returns the released state.
 
 ## Expiry Mechanism
 
@@ -163,21 +104,6 @@ For a production system at higher throughput, I would:
 - Record **metrics**: cleanup latency, count of late releases, reprocessing attempts
 - Implement **prioritization**: process reservations closest to expiry first
 - Add **dead letter queue**: handle stuck reservations separately
-
-## Deployment
-
-1. Push this repo to GitHub.
-2. Create a hosted Postgres database.
-3. Add `DATABASE_URL`, `RESERVATION_TTL_MINUTES`, and `CRON_SECRET` to Vercel.
-4. Run migrations against the hosted database:
-
-```bash
-npm run prisma:deploy
-npm run prisma:seed
-```
-
-5. Deploy the app on Vercel.
-6. Add a Vercel Cron schedule for `/api/cron/release-expired`.
 
 ## Trade-offs & Future Improvements
 
